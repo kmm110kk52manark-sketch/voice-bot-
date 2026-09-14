@@ -132,13 +132,7 @@ def normalize_audio(input_path: str, output_path: str) -> None:
 # اصلاح متن + خلاصه/توضیح حرفه‌ای
 # ---------------------------------------------------------------------------
 
-_SEP_CORRECTED = "@@CORRECTED@@"
 _SEP_SUMMARY = "@@SUMMARY@@"
-
-# متن‌های بلندتر از این حد، فقط خلاصه می‌شوند (بدون بازنویسی کامل متن)
-# چون بازنویسی کامل متن‌های خیلی طولانی پرهزینه‌تر و مستعد خطای مدل است.
-FULL_CORRECTION_CHAR_LIMIT = 2500
-
 
 _HTML_FORMAT_RULES = (
     "خروجی خلاصه را طوری بنویس که خوانا و دسته‌بندی‌شده باشد، دقیقاً با این قوانین "
@@ -150,64 +144,116 @@ _HTML_FORMAT_RULES = (
     "(چند بولت)، <b>📌 جمع‌بندی</b> (یک یا دو خط)\n"
 )
 
+# متن اصلی طولانی به تکه‌هایی با این حداکثر طول تقسیم و هر تکه جدا فرمت‌بندی می‌شود
+CHUNK_CHAR_SIZE = 1800
+# حداکثر تعداد تکه‌هایی که با هوش مصنوعی فرمت‌بندی می‌شوند (برای کنترل هزینه/زمان)
+MAX_FORMAT_CHUNKS = 6
+
+
+def split_into_sentence_chunks(text: str, max_chars: int = CHUNK_CHAR_SIZE):
+    """متن را در مرز جمله‌ها به تکه‌هایی با حداکثر طول مشخص تقسیم می‌کند."""
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    chunks, current = [], ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if len(candidate) > max_chars and current:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
+def generate_summary(raw_text: str) -> str:
+    """یک خلاصه حرفه‌ای و ساختاریافته (با تیتر و بولت) از کل متن می‌سازد."""
+    prompt = (
+        "متن زیر رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی است که ممکن "
+        "است غلط‌های تشخیصی داشته باشد. کل متن را نادیده بگیر و فقط یک خلاصه "
+        "حرفه‌ای و بدون غلط از محتوای اصلی آن بنویس.\n"
+        f"{_HTML_FORMAT_RULES}\n"
+        "خروجی را دقیقاً با این نشانه شروع کن (بدون هیچ متن دیگری قبلش):\n\n"
+        f"{_SEP_SUMMARY}\n\n"
+        f"متن خام:\n{raw_text}"
+    )
+    response = groq_client.chat.completions.create(
+        model=SUMMARY_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1500,
+    )
+    content = response.choices[0].message.content.strip()
+    if _SEP_SUMMARY in content:
+        return content.split(_SEP_SUMMARY, 1)[1].strip()
+    return content
+
+
+def format_chunk(chunk: str) -> str:
+    """یک تکه از متن خام را اصلاح، پاراگراف‌بندی و کلیدواژه‌هایش را پررنگ می‌کند."""
+    prompt = (
+        "متن زیر بخشی از رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی است "
+        "که ممکن است غلط‌های تشخیصی، بی‌نقطه‌گذاری بودن، یا کلمات نامفهوم داشته باشد.\n"
+        "این متن را ویرایش کن: غلط‌های واضح گفتار را بر اساس بافت جمله تصحیح کن، "
+        "نقطه‌گذاری مناسب اضافه کن؛ محتوا و لحن اصلی را عوض نکن. برای خوانایی بهتر:\n"
+        "- هر جا موضوع عوض می‌شود یک خط خالی بگذار تا پاراگراف جدید شروع شود "
+        "(پاراگراف‌ها را کوتاه، حدود ۲ تا ۴ جمله، نگه دار)\n"
+        "- فقط مهم‌ترین عبارات کلیدی (اسم افراد، اعداد و ارقام مهم، "
+        "نتیجه‌گیری‌های اصلی) را داخل <b>...</b> پررنگ کن؛ در هر پاراگراف حداکثر "
+        "یک یا دو عبارت پررنگ کافی است\n"
+        "- به‌جز تگ <b>، از هیچ تگ HTML یا Markdown دیگری استفاده نکن\n"
+        "- فقط خودِ متن ویرایش‌شده را برگردان، بدون هیچ توضیح یا مقدمه‌ی اضافه\n\n"
+        f"متن:\n{chunk}"
+    )
+    response = groq_client.chat.completions.create(
+        model=SUMMARY_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def format_full_transcript(raw_text: str) -> str:
+    """کل متن خام را (با تکه‌تکه کردن در صورت بلند بودن) فرمت‌بندی می‌کند."""
+    chunks = split_into_sentence_chunks(raw_text)
+    to_format, remainder = chunks[:MAX_FORMAT_CHUNKS], chunks[MAX_FORMAT_CHUNKS:]
+
+    formatted_parts = []
+    for chunk in to_format:
+        try:
+            formatted_parts.append(format_chunk(chunk))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Chunk formatting failed: %s", exc)
+            formatted_parts.append(chunk)  # حداقل خود تکه خام را نگه دار
+
+    if remainder:
+        # برای کنترل هزینه/زمان، باقیمانده‌ی خیلی طولانی فقط پاراگراف‌بندی ساده می‌شود
+        formatted_parts.append(auto_paragraph(" ".join(remainder)))
+
+    return "\n\n".join(formatted_parts)
+
 
 def polish_text(raw_text: str):
-    """متن خام رونوشت را (در صورت کوتاه بودن) اصلاح و همیشه خلاصه حرفه‌ای می‌کند.
+    """متن خام را فرمت‌بندی و خلاصه حرفه‌ای می‌کند.
 
-    خروجی: دیکشنری با دو کلید corrected و summary، یا None در صورت خطا.
+    خروجی: دیکشنری با دو کلید corrected و summary (هرکدام ممکن است None باشد
+    اگر آن مرحله خطا داد)، یا None اگر هر دو مرحله شکست خوردند.
     """
-    do_full_correction = len(raw_text) <= FULL_CORRECTION_CHAR_LIMIT
-
-    if do_full_correction:
-        prompt = (
-            "متن زیر رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی است که "
-            "ممکن است غلط‌های تشخیصی، بی‌نقطه‌گذاری بودن، یا کلمات نامفهوم داشته باشد.\n\n"
-            "دقیقاً دو بخش زیر را بنویس، هرکدام را با نشانه‌ی مشخص‌شده شروع کن "
-            "(این نشانه‌ها را دقیقاً همین‌طور تایپ کن، هیچ توضیح یا متن دیگری قبل، بین یا بعدشان ننویس):\n\n"
-            f"{_SEP_CORRECTED}\n"
-            "متن را با تصحیح غلط‌های واضح گفتار و افزودن نقطه‌گذاری مناسب بازنویسی کن؛ "
-            "محتوا و لحن اصلی را عوض نکن. این بخش را به‌صورت متن ساده (بدون تگ HTML) بنویس.\n\n"
-            f"{_SEP_SUMMARY}\n"
-            f"{_HTML_FORMAT_RULES}\n"
-            f"متن خام:\n{raw_text}"
-        )
-    else:
-        prompt = (
-            "متن زیر رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی و نسبتاً طولانی است "
-            "که ممکن است غلط‌های تشخیصی داشته باشد. کل متن را نادیده بگیر و فقط یک خلاصه "
-            "حرفه‌ای و بدون غلط از محتوای اصلی آن بنویس.\n"
-            f"{_HTML_FORMAT_RULES}\n"
-            "خروجی را دقیقاً با این نشانه شروع کن (بدون هیچ متن دیگری قبلش):\n\n"
-            f"{_SEP_SUMMARY}\n\n"
-            f"متن خام:\n{raw_text}"
-        )
+    summary = None
+    corrected = None
 
     try:
-        response = groq_client.chat.completions.create(
-            model=SUMMARY_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=4000,
-        )
-        content = response.choices[0].message.content.strip()
-
-        corrected = None
-        summary = None
-
-        if _SEP_CORRECTED in content and _SEP_SUMMARY in content:
-            after_corrected = content.split(_SEP_CORRECTED, 1)[1]
-            corrected_part, summary_part = after_corrected.split(_SEP_SUMMARY, 1)
-            corrected = corrected_part.strip()
-            summary = summary_part.strip()
-        elif _SEP_SUMMARY in content:
-            summary = content.split(_SEP_SUMMARY, 1)[1].strip()
-        else:
-            # مدل نشانه‌ها را رعایت نکرد؛ کل خروجی را به‌عنوان خلاصه در نظر می‌گیریم
-            summary = content
-
-        return {"corrected": corrected, "summary": summary}
+        summary = generate_summary(raw_text)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("اصلاح/خلاصه‌سازی ناموفق بود: %s", exc)
+        logger.warning("خلاصه‌سازی ناموفق بود: %s", exc)
+
+    try:
+        corrected = format_full_transcript(raw_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("فرمت‌بندی متن اصلی ناموفق بود: %s", exc)
+
+    if summary is None and corrected is None:
         return None
+    return {"corrected": corrected, "summary": summary}
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +302,23 @@ async def send_long_reply(status_msg, chat, text: str) -> None:
         await _safe_send(chat, chunk)
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!؟])\s+")
+
+
+def auto_paragraph(text: str, sentences_per_paragraph: int = 3) -> str:
+    """متن خام را (بدون تماس اضافه با مدل) به پاراگراف‌های کوتاه‌تر تقسیم می‌کند
+    تا خواندنش راحت‌تر شود."""
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    if len(sentences) <= sentences_per_paragraph:
+        return text
+
+    paragraphs = [
+        " ".join(sentences[i : i + sentences_per_paragraph])
+        for i in range(0, len(sentences), sentences_per_paragraph)
+    ]
+    return "\n\n".join(paragraphs)
+
+
 def _sanitize_model_html(text: str) -> str:
     """فقط تگ‌های <b> و </b> را نگه می‌دارد و بقیه‌ی متن را برای HTML امن می‌کند
     (جلوگیری از خطای تلگرام به‌خاطر تگ یا کاراکتر غیرمنتظره از خروجی مدل)."""
@@ -268,20 +331,20 @@ def _sanitize_model_html(text: str) -> str:
 async def build_final_reply(raw_text: str, loop, label: str) -> str:
     """از متن خام، پاسخ نهایی HTML (متن اصلاح‌شده/خام + خلاصه ساختاریافته) را می‌سازد."""
     if not ENABLE_SUMMARY:
-        return f"<b>📝 متن {label}:</b>\n{html.escape(raw_text)}"
+        return f"<b>📝 متن {label}:</b>\n{html.escape(auto_paragraph(raw_text))}"
 
     result = await loop.run_in_executor(None, polish_text, raw_text)
     if not result:
         # اصلاح/خلاصه‌سازی شکست خورد؛ حداقل متن خام را بفرست
-        return f"<b>📝 متن {label}:</b>\n{html.escape(raw_text)}"
+        return f"<b>📝 متن {label}:</b>\n{html.escape(auto_paragraph(raw_text))}"
 
     lines = []
     if result.get("corrected"):
         lines.append(
-            f"<b>📝 متن {label} (اصلاح‌شده):</b>\n{html.escape(result['corrected'])}"
+            f"<b>📝 متن {label} (اصلاح‌شده):</b>\n{_sanitize_model_html(result['corrected'])}"
         )
     else:
-        lines.append(f"<b>📝 متن {label}:</b>\n{html.escape(raw_text)}")
+        lines.append(f"<b>📝 متن {label}:</b>\n{html.escape(auto_paragraph(raw_text))}")
 
     if result.get("summary"):
         lines.append(f"\n\n{_sanitize_model_html(result['summary'])}")
