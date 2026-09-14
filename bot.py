@@ -319,9 +319,14 @@ def auto_paragraph(text: str, sentences_per_paragraph: int = 3) -> str:
     return "\n\n".join(paragraphs)
 
 
+_MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
 def _sanitize_model_html(text: str) -> str:
-    """فقط تگ‌های <b> و </b> را نگه می‌دارد و بقیه‌ی متن را برای HTML امن می‌کند
-    (جلوگیری از خطای تلگرام به‌خاطر تگ یا کاراکتر غیرمنتظره از خروجی مدل)."""
+    """تگ‌های <b> را نگه می‌دارد، ستاره‌های مارک‌داون (**...**) را هم به پررنگ HTML
+    تبدیل می‌کند (چون بعضی وقت‌ها مدل به‌جای <b> از ** استفاده می‌کند)، و بقیه‌ی
+    متن را برای HTML امن می‌کند."""
+    text = _MARKDOWN_BOLD_RE.sub(r"<b>\1</b>", text)
     text = text.replace("<b>", "\x00B\x00").replace("</b>", "\x00/B\x00")
     text = html.escape(text, quote=False)
     text = text.replace("\x00B\x00", "<b>").replace("\x00/B\x00", "</b>")
