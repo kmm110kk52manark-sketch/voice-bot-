@@ -130,37 +130,67 @@ def normalize_audio(input_path: str, output_path: str) -> None:
 # اصلاح متن + خلاصه/توضیح حرفه‌ای
 # ---------------------------------------------------------------------------
 
-_SEPARATOR = "---خلاصه---"
+_SEP_CORRECTED = "@@CORRECTED@@"
+_SEP_SUMMARY = "@@SUMMARY@@"
+
+# متن‌های بلندتر از این حد، فقط خلاصه می‌شوند (بدون بازنویسی کامل متن)
+# چون بازنویسی کامل متن‌های خیلی طولانی پرهزینه‌تر و مستعد خطای مدل است.
+FULL_CORRECTION_CHAR_LIMIT = 2500
 
 
 def polish_text(raw_text: str):
-    """متن خام رونوشت را اصلاح (غلط‌گیری/نقطه‌گذاری) و خلاصه حرفه‌ای می‌کند.
+    """متن خام رونوشت را (در صورت کوتاه بودن) اصلاح و همیشه خلاصه حرفه‌ای می‌کند.
 
     خروجی: دیکشنری با دو کلید corrected و summary، یا None در صورت خطا.
     """
-    try:
+    do_full_correction = len(raw_text) <= FULL_CORRECTION_CHAR_LIMIT
+
+    if do_full_correction:
         prompt = (
             "متن زیر رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی است که "
             "ممکن است غلط‌های تشخیصی، بی‌نقطه‌گذاری بودن، یا کلمات نامفهوم داشته باشد.\n\n"
-            "۱. ابتدا این متن را ویرایش کن: غلط‌های واضح تشخیص گفتار را بر اساس "
-            "بافت جمله تصحیح کن، نقطه‌گذاری مناسب (نقطه، ویرگول) اضافه کن، ولی "
-            "محتوا و لحن اصلی گوینده را عوض نکن و چیزی از خودت اضافه نکن.\n"
-            "۲. سپس یک خلاصه حرفه‌ای و روشن در ۲ تا ۴ جمله از متن بنویس.\n\n"
-            f"خروجی را دقیقاً با همین قالب بده (بدون توضیح اضافه):\n"
-            f"متن اصلاح‌شده اینجا\n{_SEPARATOR}\nخلاصه اینجا\n\n"
+            "دقیقاً دو بخش زیر را بنویس، هرکدام را با نشانه‌ی مشخص‌شده شروع کن "
+            "(این نشانه‌ها را دقیقاً همین‌طور تایپ کن، هیچ توضیح یا متن دیگری قبل، بین یا بعدشان ننویس):\n\n"
+            f"{_SEP_CORRECTED}\n"
+            "متن را با تصحیح غلط‌های واضح گفتار و افزودن نقطه‌گذاری مناسب بازنویسی کن؛ "
+            "محتوا و لحن اصلی را عوض نکن.\n\n"
+            f"{_SEP_SUMMARY}\n"
+            "یک خلاصه حرفه‌ای و روشن در ۲ تا ۴ جمله بنویس.\n\n"
             f"متن خام:\n{raw_text}"
         )
+    else:
+        prompt = (
+            "متن زیر رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی و نسبتاً طولانی است "
+            "که ممکن است غلط‌های تشخیصی داشته باشد. کل متن را نادیده بگیر و فقط یک خلاصه "
+            "حرفه‌ای، روان و بدون غلط در ۴ تا ۶ جمله از محتوای اصلی آن بنویس. "
+            "خروجی را دقیقاً با این نشانه شروع کن (بدون هیچ متن دیگری قبلش):\n\n"
+            f"{_SEP_SUMMARY}\n\n"
+            f"متن خام:\n{raw_text}"
+        )
+
+    try:
         response = groq_client.chat.completions.create(
             model=SUMMARY_MODEL,
             messages=[{"role": "user", "content": prompt}],
+            max_tokens=4000,
         )
         content = response.choices[0].message.content.strip()
 
-        if _SEPARATOR in content:
-            corrected, summary = content.split(_SEPARATOR, 1)
-            return {"corrected": corrected.strip(), "summary": summary.strip()}
-        # اگر مدل قالب را رعایت نکرد، کل خروجی را به‌عنوان خلاصه در نظر می‌گیریم
-        return {"corrected": None, "summary": content}
+        corrected = None
+        summary = None
+
+        if _SEP_CORRECTED in content and _SEP_SUMMARY in content:
+            after_corrected = content.split(_SEP_CORRECTED, 1)[1]
+            corrected_part, summary_part = after_corrected.split(_SEP_SUMMARY, 1)
+            corrected = corrected_part.strip()
+            summary = summary_part.strip()
+        elif _SEP_SUMMARY in content:
+            summary = content.split(_SEP_SUMMARY, 1)[1].strip()
+        else:
+            # مدل نشانه‌ها را رعایت نکرد؛ کل خروجی را به‌عنوان خلاصه در نظر می‌گیریم
+            summary = content
+
+        return {"corrected": corrected, "summary": summary}
     except Exception as exc:  # noqa: BLE001
         logger.warning("اصلاح/خلاصه‌سازی ناموفق بود: %s", exc)
         return None
