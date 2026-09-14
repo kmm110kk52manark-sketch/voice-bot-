@@ -6,8 +6,10 @@
 """
 
 import asyncio
+import html
 import logging
 import os
+import re
 import subprocess
 import tempfile
 
@@ -138,6 +140,17 @@ _SEP_SUMMARY = "@@SUMMARY@@"
 FULL_CORRECTION_CHAR_LIMIT = 2500
 
 
+_HTML_FORMAT_RULES = (
+    "خروجی خلاصه را طوری بنویس که خوانا و دسته‌بندی‌شده باشد، دقیقاً با این قوانین "
+    "قالب‌بندی HTML سادهٔ تلگرام (فقط از تگ <b>...</b> برای تیترها استفاده کن، "
+    "هیچ تگ دیگری مثل <ul> یا <h1> یا Markdown با ستاره به کار نبر):\n"
+    "- هر تیتر بخش را داخل <b>...</b> بگذار و یک ایموجی مرتبط قبلش بیاور\n"
+    "- زیر هر تیتر، نکات را در خط‌های جدا و هرکدام با «• » شروع کن\n"
+    "- ساختار پیشنهادی: <b>🎯 موضوع اصلی</b> (یک خط)، <b>🔑 نکات کلیدی</b> "
+    "(چند بولت)، <b>📌 جمع‌بندی</b> (یک یا دو خط)\n"
+)
+
+
 def polish_text(raw_text: str):
     """متن خام رونوشت را (در صورت کوتاه بودن) اصلاح و همیشه خلاصه حرفه‌ای می‌کند.
 
@@ -153,16 +166,17 @@ def polish_text(raw_text: str):
             "(این نشانه‌ها را دقیقاً همین‌طور تایپ کن، هیچ توضیح یا متن دیگری قبل، بین یا بعدشان ننویس):\n\n"
             f"{_SEP_CORRECTED}\n"
             "متن را با تصحیح غلط‌های واضح گفتار و افزودن نقطه‌گذاری مناسب بازنویسی کن؛ "
-            "محتوا و لحن اصلی را عوض نکن.\n\n"
+            "محتوا و لحن اصلی را عوض نکن. این بخش را به‌صورت متن ساده (بدون تگ HTML) بنویس.\n\n"
             f"{_SEP_SUMMARY}\n"
-            "یک خلاصه حرفه‌ای و روشن در ۲ تا ۴ جمله بنویس.\n\n"
+            f"{_HTML_FORMAT_RULES}\n"
             f"متن خام:\n{raw_text}"
         )
     else:
         prompt = (
             "متن زیر رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی و نسبتاً طولانی است "
             "که ممکن است غلط‌های تشخیصی داشته باشد. کل متن را نادیده بگیر و فقط یک خلاصه "
-            "حرفه‌ای، روان و بدون غلط در ۴ تا ۶ جمله از محتوای اصلی آن بنویس. "
+            "حرفه‌ای و بدون غلط از محتوای اصلی آن بنویس.\n"
+            f"{_HTML_FORMAT_RULES}\n"
             "خروجی را دقیقاً با این نشانه شروع کن (بدون هیچ متن دیگری قبلش):\n\n"
             f"{_SEP_SUMMARY}\n\n"
             f"متن خام:\n{raw_text}"
@@ -208,40 +222,69 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 TELEGRAM_MAX_LEN = 4000  # کمی کمتر از سقف واقعی تلگرام (۴۰۹۶) برای احتیاط
+_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+
+
+async def _safe_edit(status_msg, text: str) -> None:
+    """پیام را با فرمت HTML ویرایش می‌کند؛ اگر تلگرام فرمت را رد کرد، متن ساده می‌فرستد."""
+    try:
+        await status_msg.edit_text(text, parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        logger.warning("HTML parse failed, falling back to plain text")
+        await status_msg.edit_text(_TAG_STRIP_RE.sub("", text))
+
+
+async def _safe_send(chat, text: str) -> None:
+    try:
+        await chat.send_message(text, parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        logger.warning("HTML parse failed, falling back to plain text")
+        await chat.send_message(_TAG_STRIP_RE.sub("", text))
 
 
 async def send_long_reply(status_msg, chat, text: str) -> None:
     """پاسخ را در صورت طولانی بودن به چند پیام تقسیم می‌کند (سقف تلگرام ۴۰۹۶ کاراکتر)."""
     if len(text) <= TELEGRAM_MAX_LEN:
-        await status_msg.edit_text(text)
+        await _safe_edit(status_msg, text)
         return
 
     chunks = [
         text[i : i + TELEGRAM_MAX_LEN] for i in range(0, len(text), TELEGRAM_MAX_LEN)
     ]
-    await status_msg.edit_text(chunks[0])
+    await _safe_edit(status_msg, chunks[0])
     for chunk in chunks[1:]:
-        await chat.send_message(chunk)
+        await _safe_send(chat, chunk)
+
+
+def _sanitize_model_html(text: str) -> str:
+    """فقط تگ‌های <b> و </b> را نگه می‌دارد و بقیه‌ی متن را برای HTML امن می‌کند
+    (جلوگیری از خطای تلگرام به‌خاطر تگ یا کاراکتر غیرمنتظره از خروجی مدل)."""
+    text = text.replace("<b>", "\x00B\x00").replace("</b>", "\x00/B\x00")
+    text = html.escape(text, quote=False)
+    text = text.replace("\x00B\x00", "<b>").replace("\x00/B\x00", "</b>")
+    return text
 
 
 async def build_final_reply(raw_text: str, loop, label: str) -> str:
-    """از متن خام، پاسخ نهایی (متن اصلاح‌شده + خلاصه یا فقط متن خام) را می‌سازد."""
+    """از متن خام، پاسخ نهایی HTML (متن اصلاح‌شده/خام + خلاصه ساختاریافته) را می‌سازد."""
     if not ENABLE_SUMMARY:
-        return f"📝 متن {label}:\n{raw_text}"
+        return f"<b>📝 متن {label}:</b>\n{html.escape(raw_text)}"
 
     result = await loop.run_in_executor(None, polish_text, raw_text)
     if not result:
         # اصلاح/خلاصه‌سازی شکست خورد؛ حداقل متن خام را بفرست
-        return f"📝 متن {label}:\n{raw_text}"
+        return f"<b>📝 متن {label}:</b>\n{html.escape(raw_text)}"
 
     lines = []
     if result.get("corrected"):
-        lines.append(f"📝 متن {label} (اصلاح‌شده):\n{result['corrected']}")
+        lines.append(
+            f"<b>📝 متن {label} (اصلاح‌شده):</b>\n{html.escape(result['corrected'])}"
+        )
     else:
-        lines.append(f"📝 متن {label}:\n{raw_text}")
+        lines.append(f"<b>📝 متن {label}:</b>\n{html.escape(raw_text)}")
 
     if result.get("summary"):
-        lines.append(f"\n\n📌 خلاصه حرفه‌ای:\n{result['summary']}")
+        lines.append(f"\n\n{_sanitize_model_html(result['summary'])}")
 
     return "\n".join(lines)
 
