@@ -50,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY, timeout=90.0)
 
 # ---------------------------------------------------------------------------
 # تبدیل صدا به متن
@@ -177,6 +177,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+TELEGRAM_MAX_LEN = 4000  # کمی کمتر از سقف واقعی تلگرام (۴۰۹۶) برای احتیاط
+
+
+async def send_long_reply(status_msg, chat, text: str) -> None:
+    """پاسخ را در صورت طولانی بودن به چند پیام تقسیم می‌کند (سقف تلگرام ۴۰۹۶ کاراکتر)."""
+    if len(text) <= TELEGRAM_MAX_LEN:
+        await status_msg.edit_text(text)
+        return
+
+    chunks = [
+        text[i : i + TELEGRAM_MAX_LEN] for i in range(0, len(text), TELEGRAM_MAX_LEN)
+    ]
+    await status_msg.edit_text(chunks[0])
+    for chunk in chunks[1:]:
+        await chat.send_message(chunk)
+
+
 async def build_final_reply(raw_text: str, loop, label: str) -> str:
     """از متن خام، پاسخ نهایی (متن اصلاح‌شده + خلاصه یا فقط متن خام) را می‌سازد."""
     if not ENABLE_SUMMARY:
@@ -239,8 +256,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         await status_msg.edit_text("در حال اصلاح و خلاصه‌سازی... ✍️")
-        final_reply = await build_final_reply(text, loop, "ویس")
-        await status_msg.edit_text(final_reply)
+        try:
+            final_reply = await build_final_reply(text, loop, "ویس")
+            await send_long_reply(status_msg, update.message.chat, final_reply)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to build/send final reply")
+            await status_msg.edit_text(
+                f"📝 متن ویس:\n{text}\n\n(خطا در مرحله خلاصه‌سازی: {exc})"
+            )
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -285,8 +308,14 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         await status_msg.edit_text("در حال اصلاح و خلاصه‌سازی... ✍️")
-        final_reply = await build_final_reply(text, loop, "ویدیو")
-        await status_msg.edit_text(final_reply)
+        try:
+            final_reply = await build_final_reply(text, loop, "ویدیو")
+            await send_long_reply(status_msg, msg.chat, final_reply)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to build/send final reply")
+            await status_msg.edit_text(
+                f"📝 متن ویدیو:\n{text}\n\n(خطا در مرحله خلاصه‌سازی: {exc})"
+            )
 
 
 # ---------------------------------------------------------------------------
