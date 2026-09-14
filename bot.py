@@ -30,9 +30,19 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
-SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "llama-3.1-8b-instant")
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "openai/gpt-oss-120b")
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "fa")
 ENABLE_SUMMARY = os.environ.get("ENABLE_SUMMARY", "true").lower() == "true"
+
+# متن راهنما به مدل برای بهتر تشخیص دادن اسامی خاص و اصطلاحات رایج.
+# می‌توانید در Railway، متغیر WHISPER_PROMPT را با اسامی/اصطلاحات پرتکرار
+# محتوای خودتان (اسم افراد، برندها، واژه‌های تخصصی) جایگزین یا تکمیل کنید.
+WHISPER_PROMPT = os.environ.get(
+    "WHISPER_PROMPT",
+    "این یک فایل صوتی گفتاری، محاوره‌ای و روان به زبان فارسی است. "
+    "لطفاً علائم نگارشی مناسب (نقطه، ویرگول) را رعایت کن. "
+    "نمونه اسامی رایج: ایلان ماسک، پیکاسو، اینستاگرام، بیت‌کوین.",
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -53,16 +63,22 @@ def transcribe_audio(file_path: str) -> str:
             file=audio_file,
             model=WHISPER_MODEL,
             language=WHISPER_LANGUAGE or None,
+            prompt=WHISPER_PROMPT or None,
+            temperature=0,
         )
     return result.text.strip()
 
 
 # ---------------------------------------------------------------------------
-# استخراج صدا از ویدیو
+# استخراج و نرمال‌سازی صدا (از ویس یا ویدیو)
 # ---------------------------------------------------------------------------
+
+# فیلتر نرمال‌سازی بلندی صدا + کاهش نویز فرکانس پایین (مثل هوم/نویز پس‌زمینه)
+_AUDIO_FILTER = "highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11"
 
 
 def extract_audio_from_video(video_path: str, audio_path: str) -> None:
+    """صدا را از فایل ویدیویی جدا و نرمال‌سازی می‌کند."""
     ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
     subprocess.run(
         [
@@ -71,6 +87,8 @@ def extract_audio_from_video(video_path: str, audio_path: str) -> None:
             "-i",
             video_path,
             "-vn",
+            "-af",
+            _AUDIO_FILTER,
             "-acodec",
             "libmp3lame",
             "-ar",
@@ -85,24 +103,66 @@ def extract_audio_from_video(video_path: str, audio_path: str) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# خلاصه/توضیح متن
-# ---------------------------------------------------------------------------
+def normalize_audio(input_path: str, output_path: str) -> None:
+    """فایل صوتی (مثل ویس تلگرام) را نرمال‌سازی می‌کند تا دقت تشخیص گفتار بهتر شود."""
+    ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            input_path,
+            "-af",
+            _AUDIO_FILTER,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            output_path,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
-def summarize_text(text: str):
+# ---------------------------------------------------------------------------
+# اصلاح متن + خلاصه/توضیح حرفه‌ای
+# ---------------------------------------------------------------------------
+
+_SEPARATOR = "---خلاصه---"
+
+
+def polish_text(raw_text: str):
+    """متن خام رونوشت را اصلاح (غلط‌گیری/نقطه‌گذاری) و خلاصه حرفه‌ای می‌کند.
+
+    خروجی: دیکشنری با دو کلید corrected و summary، یا None در صورت خطا.
+    """
     try:
         prompt = (
-            "متن زیر رونوشت یک پیام صوتی است. آن را به فارسی، در ۲ تا ۴ جمله، "
-            "خلاصه و روشن توضیح بده:\n\n" + text
+            "متن زیر رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی است که "
+            "ممکن است غلط‌های تشخیصی، بی‌نقطه‌گذاری بودن، یا کلمات نامفهوم داشته باشد.\n\n"
+            "۱. ابتدا این متن را ویرایش کن: غلط‌های واضح تشخیص گفتار را بر اساس "
+            "بافت جمله تصحیح کن، نقطه‌گذاری مناسب (نقطه، ویرگول) اضافه کن، ولی "
+            "محتوا و لحن اصلی گوینده را عوض نکن و چیزی از خودت اضافه نکن.\n"
+            "۲. سپس یک خلاصه حرفه‌ای و روشن در ۲ تا ۴ جمله از متن بنویس.\n\n"
+            f"خروجی را دقیقاً با همین قالب بده (بدون توضیح اضافه):\n"
+            f"متن اصلاح‌شده اینجا\n{_SEPARATOR}\nخلاصه اینجا\n\n"
+            f"متن خام:\n{raw_text}"
         )
         response = groq_client.chat.completions.create(
             model=SUMMARY_MODEL,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.choices[0].message.content.strip()
+        content = response.choices[0].message.content.strip()
+
+        if _SEPARATOR in content:
+            corrected, summary = content.split(_SEPARATOR, 1)
+            return {"corrected": corrected.strip(), "summary": summary.strip()}
+        # اگر مدل قالب را رعایت نکرد، کل خروجی را به‌عنوان خلاصه در نظر می‌گیریم
+        return {"corrected": None, "summary": content}
     except Exception as exc:  # noqa: BLE001
-        logger.warning("خلاصه‌سازی ناموفق بود: %s", exc)
+        logger.warning("اصلاح/خلاصه‌سازی ناموفق بود: %s", exc)
         return None
 
 
@@ -117,6 +177,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def build_final_reply(raw_text: str, loop, label: str) -> str:
+    """از متن خام، پاسخ نهایی (متن اصلاح‌شده + خلاصه یا فقط متن خام) را می‌سازد."""
+    if not ENABLE_SUMMARY:
+        return f"📝 متن {label}:\n{raw_text}"
+
+    result = await loop.run_in_executor(None, polish_text, raw_text)
+    if not result:
+        # اصلاح/خلاصه‌سازی شکست خورد؛ حداقل متن خام را بفرست
+        return f"📝 متن {label}:\n{raw_text}"
+
+    lines = []
+    if result.get("corrected"):
+        lines.append(f"📝 متن {label} (اصلاح‌شده):\n{result['corrected']}")
+    else:
+        lines.append(f"📝 متن {label}:\n{raw_text}")
+
+    if result.get("summary"):
+        lines.append(f"\n\n📌 خلاصه حرفه‌ای:\n{result['summary']}")
+
+    return "\n".join(lines)
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     voice = update.message.voice or update.message.audio
     if voice is None:
@@ -126,14 +208,27 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         ogg_path = os.path.join(tmp_dir, "voice.ogg")
+        wav_path = os.path.join(tmp_dir, "voice_normalized.wav")
         tg_file = await context.bot.get_file(voice.file_id)
         await tg_file.download_to_drive(ogg_path)
 
+        loop = asyncio.get_running_loop()
+
+        await status_msg.edit_text("در حال بهبود کیفیت صدا... 🔊")
+        try:
+            await loop.run_in_executor(None, normalize_audio, ogg_path, wav_path)
+            audio_for_transcription = wav_path
+        except subprocess.CalledProcessError:
+            # اگر نرمال‌سازی به هر دلیلی شکست خورد، از فایل اصلی استفاده می‌کنیم
+            logger.warning("Audio normalization failed; falling back to raw file")
+            audio_for_transcription = ogg_path
+
         await status_msg.edit_text("در حال تبدیل صدا به متن... 🎙️")
 
-        loop = asyncio.get_running_loop()
         try:
-            text = await loop.run_in_executor(None, transcribe_audio, ogg_path)
+            text = await loop.run_in_executor(
+                None, transcribe_audio, audio_for_transcription
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Transcription failed")
             await status_msg.edit_text(f"خطا در تبدیل صدا به متن: {exc}")
@@ -143,15 +238,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status_msg.edit_text("متأسفانه چیزی از این ویس تشخیص داده نشد.")
             return
 
-        reply_lines = [f"📝 متن ویس:\n{text}"]
-
-        if ENABLE_SUMMARY:
-            await status_msg.edit_text("در حال خلاصه‌سازی... ✍️")
-            summary = await loop.run_in_executor(None, summarize_text, text)
-            if summary:
-                reply_lines.append(f"\n\n📌 خلاصه/توضیح:\n{summary}")
-
-        await status_msg.edit_text("\n".join(reply_lines))
+        await status_msg.edit_text("در حال اصلاح و خلاصه‌سازی... ✍️")
+        final_reply = await build_final_reply(text, loop, "ویس")
+        await status_msg.edit_text(final_reply)
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -195,15 +284,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status_msg.edit_text("متأسفانه چیزی از صدای این ویدیو تشخیص داده نشد.")
             return
 
-        reply_lines = [f"📝 متن ویدیو:\n{text}"]
-
-        if ENABLE_SUMMARY:
-            await status_msg.edit_text("در حال خلاصه‌سازی... ✍️")
-            summary = await loop.run_in_executor(None, summarize_text, text)
-            if summary:
-                reply_lines.append(f"\n\n📌 خلاصه/توضیح:\n{summary}")
-
-        await status_msg.edit_text("\n".join(reply_lines))
+        await status_msg.edit_text("در حال اصلاح و خلاصه‌سازی... ✍️")
+        final_reply = await build_final_reply(text, loop, "ویدیو")
+        await status_msg.edit_text(final_reply)
 
 
 # ---------------------------------------------------------------------------
