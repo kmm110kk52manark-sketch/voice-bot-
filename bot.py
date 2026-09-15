@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 
 import imageio_ffmpeg
+import db as subscriptions
 from groq import Groq
 from telegram import Update
 from telegram.ext import (
@@ -30,6 +31,10 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+
+# آیدی عددی تلگرام مالک ربات (همیشه دسترسی کامل دارد، حتی بدون اشتراک).
+# آیدی عددی خودتان را می‌توانید با فرستادن پیام به رباتی مثل @userinfobot بگیرید.
+ADMIN_TELEGRAM_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "0"))
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "openai/gpt-oss-120b")
@@ -166,8 +171,12 @@ def split_into_sentence_chunks(text: str, max_chars: int = CHUNK_CHAR_SIZE):
     return chunks or [text]
 
 
-def generate_summary(raw_text: str) -> str:
-    """یک خلاصه حرفه‌ای و ساختاریافته (با تیتر و بولت) از کل متن می‌سازد."""
+_SEP_TEXT = "@@TEXT@@"
+_SEP_POINTS = "@@POINTS@@"
+
+
+def generate_summary_direct(raw_text: str) -> str:
+    """خلاصه‌سازی مستقیم از کل متن خام (فقط به‌عنوان راه برگشت اضطراری)."""
     prompt = (
         "متن زیر رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی است که ممکن "
         "است غلط‌های تشخیصی داشته باشد. کل متن را نادیده بگیر و فقط یک خلاصه "
@@ -188,48 +197,127 @@ def generate_summary(raw_text: str) -> str:
     return content
 
 
-def format_chunk(chunk: str) -> str:
-    """یک تکه از متن خام را اصلاح، پاراگراف‌بندی و کلیدواژه‌هایش را پررنگ می‌کند."""
+def synthesize_summary(combined_points: str) -> str:
+    """از روی نکات کلیدی جمع‌آوری‌شده از همه‌ی تکه‌های متن، خلاصه نهایی می‌سازد.
+
+    چون نکات از تک‌تک تکه‌های متن (نه کل متن یک‌جا) استخراج شده‌اند، احتمال
+    نادیده گرفتن مطلبی از وسط متن‌های طولانی خیلی کمتر می‌شود.
+    """
+    prompt = (
+        "در ادامه فهرستی از نکات کلیدی است که جداگانه از بخش‌های مختلف یک "
+        "فایل صوتی/ویدیویی فارسی استخراج شده‌اند. بر اساس همه‌ی این نکات "
+        "(هیچ‌کدام را حذف نکن، حتی نکات میانی)، یک خلاصه حرفه‌ای و منسجم بنویس.\n"
+        f"{_HTML_FORMAT_RULES}\n"
+        "خروجی را دقیقاً با این نشانه شروع کن (بدون هیچ متن دیگری قبلش):\n\n"
+        f"{_SEP_SUMMARY}\n\n"
+        f"نکات کلیدی همه بخش‌ها:\n{combined_points}"
+    )
+    response = groq_client.chat.completions.create(
+        model=SUMMARY_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1500,
+    )
+    content = response.choices[0].message.content.strip()
+    if _SEP_SUMMARY in content:
+        return content.split(_SEP_SUMMARY, 1)[1].strip()
+    return content
+
+
+def format_chunk(chunk: str) -> dict:
+    """یک تکه از متن خام را هم فرمت‌بندی می‌کند (اصلاح/پاراگراف/پررنگ)، هم
+    نکات کلیدی‌اش را استخراج می‌کند (برای استفاده در خلاصه نهایی)."""
     prompt = (
         "متن زیر بخشی از رونوشت خام یک تشخیص گفتار (speech-to-text) فارسی است "
-        "که ممکن است غلط‌های تشخیصی، بی‌نقطه‌گذاری بودن، یا کلمات نامفهوم داشته باشد.\n"
+        "که ممکن است غلط‌های تشخیصی، بی‌نقطه‌گذاری بودن، یا کلمات نامفهوم داشته باشد.\n\n"
+        "دقیقاً دو بخش زیر را بنویس، هرکدام را با نشانه‌ی مشخص‌شده شروع کن "
+        "(این نشانه‌ها را دقیقاً همین‌طور تایپ کن، بدون توضیح اضافه):\n\n"
+        f"{_SEP_TEXT}\n"
         "این متن را ویرایش کن: غلط‌های واضح گفتار را بر اساس بافت جمله تصحیح کن، "
         "نقطه‌گذاری مناسب اضافه کن؛ محتوا و لحن اصلی را عوض نکن. برای خوانایی بهتر:\n"
         "- هر جا موضوع عوض می‌شود یک خط خالی بگذار تا پاراگراف جدید شروع شود "
         "(پاراگراف‌ها را کوتاه، حدود ۲ تا ۴ جمله، نگه دار)\n"
         "- فقط مهم‌ترین عبارات کلیدی (اسم افراد، اعداد و ارقام مهم، "
         "نتیجه‌گیری‌های اصلی) را داخل <b>...</b> پررنگ کن؛ در هر پاراگراف حداکثر "
-        "یک یا دو عبارت پررنگ کافی است\n"
-        "- به‌جز تگ <b>، از هیچ تگ HTML یا Markdown دیگری استفاده نکن\n"
-        "- فقط خودِ متن ویرایش‌شده را برگردان، بدون هیچ توضیح یا مقدمه‌ی اضافه\n\n"
+        "یک یا دو عبارت پررنگ کافی است. به‌جز تگ <b>، از هیچ تگ HTML یا "
+        "Markdown دیگری (مثل ** یا #) استفاده نکن\n\n"
+        f"{_SEP_POINTS}\n"
+        "فهرست ۲ تا ۵ نکته یا واقعیت کلیدی همین بخش را بنویس (چیزهایی که اگر "
+        "در خلاصه نهایی نیایند، مطلب مهمی جا می‌افتد). هر نکته یک خط جدا و با "
+        "«- » شروع شود. فقط متن ساده، بدون تگ HTML.\n\n"
         f"متن:\n{chunk}"
     )
     response = groq_client.chat.completions.create(
         model=SUMMARY_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000,
+        max_tokens=2500,
+    )
+    content = response.choices[0].message.content.strip()
+
+    text_part, points_part = chunk, ""
+    if _SEP_TEXT in content and _SEP_POINTS in content:
+        after_text = content.split(_SEP_TEXT, 1)[1]
+        text_part, points_part = after_text.split(_SEP_POINTS, 1)
+        text_part, points_part = text_part.strip(), points_part.strip()
+    elif _SEP_TEXT in content:
+        text_part = content.split(_SEP_TEXT, 1)[1].strip()
+
+    return {"text": text_part, "points": points_part}
+
+
+def extract_points_only(chunk: str) -> str:
+    """فقط نکات کلیدی یک تکه را استخراج می‌کند (ارزان‌تر از format_chunk،
+    برای تکه‌های اضافی که فرمت‌بندی کامل نمی‌شوند)."""
+    prompt = (
+        "متن زیر بخشی از رونوشت خام یک تشخیص گفتار فارسی است. فهرست ۲ تا ۵ "
+        "نکته یا واقعیت کلیدی این بخش را بنویس (چیزهایی که اگر در خلاصه نهایی "
+        "نیایند، مطلب مهمی جا می‌افتد). هر نکته یک خط جدا و با «- » شروع شود. "
+        "فقط همین فهرست را برگردان، بدون توضیح اضافه.\n\n"
+        f"متن:\n{chunk}"
+    )
+    response = groq_client.chat.completions.create(
+        model=SUMMARY_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=400,
     )
     return response.choices[0].message.content.strip()
 
 
-def format_full_transcript(raw_text: str) -> str:
-    """کل متن خام را (با تکه‌تکه کردن در صورت بلند بودن) فرمت‌بندی می‌کند."""
+def format_full_transcript(raw_text: str):
+    """کل متن خام را فرمت‌بندی می‌کند و هم‌زمان نکات کلیدی همه‌ی تکه‌ها را
+    جمع‌آوری می‌کند تا خلاصه نهایی از روی آن‌ها ساخته شود.
+
+    خروجی: (متن_فرمت‌بندی‌شده, نکات_کلیدی_ترکیبی)
+    """
     chunks = split_into_sentence_chunks(raw_text)
     to_format, remainder = chunks[:MAX_FORMAT_CHUNKS], chunks[MAX_FORMAT_CHUNKS:]
 
     formatted_parts = []
+    all_points = []
+
     for chunk in to_format:
         try:
-            formatted_parts.append(format_chunk(chunk))
+            result = format_chunk(chunk)
+            formatted_parts.append(result["text"])
+            if result["points"]:
+                all_points.append(result["points"])
         except Exception as exc:  # noqa: BLE001
             logger.warning("Chunk formatting failed: %s", exc)
             formatted_parts.append(chunk)  # حداقل خود تکه خام را نگه دار
 
-    if remainder:
-        # برای کنترل هزینه/زمان، باقیمانده‌ی خیلی طولانی فقط پاراگراف‌بندی ساده می‌شود
-        formatted_parts.append(auto_paragraph(" ".join(remainder)))
+    for chunk in remainder:
+        # برای کنترل هزینه/زمان، فقط پاراگراف‌بندی ساده (بدون فرمت هوش مصنوعی)
+        # ولی نکات کلیدی‌اش را همچنان استخراج می‌کنیم تا در خلاصه گم نشود
+        formatted_parts.append(auto_paragraph(chunk))
+        try:
+            points = extract_points_only(chunk)
+            if points:
+                all_points.append(points)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Point extraction failed for remainder chunk: %s", exc)
 
-    return "\n\n".join(formatted_parts)
+    corrected = "\n\n".join(formatted_parts)
+    combined_points = "\n".join(all_points)
+    return corrected, combined_points
 
 
 def polish_text(raw_text: str):
@@ -238,18 +326,23 @@ def polish_text(raw_text: str):
     خروجی: دیکشنری با دو کلید corrected و summary (هرکدام ممکن است None باشد
     اگر آن مرحله خطا داد)، یا None اگر هر دو مرحله شکست خوردند.
     """
-    summary = None
     corrected = None
+    combined_points = None
+    summary = None
 
     try:
-        summary = generate_summary(raw_text)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("خلاصه‌سازی ناموفق بود: %s", exc)
-
-    try:
-        corrected = format_full_transcript(raw_text)
+        corrected, combined_points = format_full_transcript(raw_text)
     except Exception as exc:  # noqa: BLE001
         logger.warning("فرمت‌بندی متن اصلی ناموفق بود: %s", exc)
+
+    try:
+        if combined_points:
+            summary = synthesize_summary(combined_points)
+        else:
+            # اگر جمع‌آوری نکات کلیدی کلاً شکست خورد، مستقیم از کل متن خلاصه بگیر
+            summary = generate_summary_direct(raw_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("خلاصه‌سازی ناموفق بود: %s", exc)
 
     if summary is None and corrected is None:
         return None
@@ -261,14 +354,107 @@ def polish_text(raw_text: str):
 # ---------------------------------------------------------------------------
 
 
+def _is_authorized(telegram_id: int) -> bool:
+    if telegram_id == ADMIN_TELEGRAM_ID:
+        return True
+    try:
+        return subscriptions.is_subscribed(telegram_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Subscription check failed: %s", exc)
+        # اگر دیتابیس در دسترس نبود، برای احتیاط دسترسی را رد می‌کنیم
+        return False
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "سلام! یک پیام صوتی (ویس) برام بفرست تا متنش کنم و خلاصه‌اش رو بهت بدم."
-    )
+    user_id = update.effective_user.id
+    if _is_authorized(user_id):
+        await update.message.reply_text(
+            "سلام! یک پیام صوتی یا ویدیو برام بفرست تا متنش کنم و خلاصه‌اش رو بهت بدم."
+        )
+    else:
+        await update.message.reply_text(
+            "سلام! برای استفاده از این ربات نیاز به اشتراک فعال داری. "
+            "برای خرید یا تمدید اشتراک با ادمین در ارتباط باش."
+        )
+
+
+async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """فقط ادمین: /adduser <آیدی_عددی_تلگرام> <تعداد_روز> [نام دلخواه]"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "استفاده: /adduser <آیدی_تلگرام> <تعداد_روز> [نام]"
+        )
+        return
+    try:
+        telegram_id = int(args[0])
+        days = int(args[1])
+    except ValueError:
+        await update.message.reply_text("آیدی و تعداد روز باید عدد باشند.")
+        return
+    display_name = " ".join(args[2:])
+    try:
+        new_expiry = subscriptions.add_or_renew_subscriber(
+            telegram_id, days, display_name
+        )
+        await update.message.reply_text(
+            f"✅ اشتراک {telegram_id} تا تاریخ {new_expiry} فعال شد."
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("adduser failed")
+        await update.message.reply_text(f"خطا: {exc}")
+
+
+async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """فقط ادمین: /removeuser <آیدی_عددی_تلگرام>"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("استفاده: /removeuser <آیدی_تلگرام>")
+        return
+    try:
+        telegram_id = int(context.args[0])
+        subscriptions.remove_subscriber(telegram_id)
+        await update.message.reply_text(f"❌ اشتراک {telegram_id} حذف شد.")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("removeuser failed")
+        await update.message.reply_text(f"خطا: {exc}")
+
+
+async def listusers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """فقط ادمین: /listusers"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+    try:
+        rows = subscriptions.list_subscribers()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("listusers failed")
+        await update.message.reply_text(f"خطا: {exc}")
+        return
+
+    if not rows:
+        await update.message.reply_text("هنوز مشترکی ثبت نشده.")
+        return
+
+    lines = []
+    for row in rows:
+        status = "✅ فعال" if row["active"] else "⛔ منقضی"
+        name = row["display_name"] or "-"
+        lines.append(f"{row['telegram_id']} | {name} | تا {row['expires_at']} | {status}")
+    await send_long_reply_plain(update.message, "\n".join(lines))
 
 
 TELEGRAM_MAX_LEN = 4000  # کمی کمتر از سقف واقعی تلگرام (۴۰۹۶) برای احتیاط
 _TAG_STRIP_RE = re.compile(r"<[^>]+>")
+
+
+async def send_long_reply_plain(message, text: str) -> None:
+    """برای پیام‌های متن ساده (بدون HTML) مثل خروجی /listusers."""
+    for i in range(0, len(text), TELEGRAM_MAX_LEN):
+        await message.reply_text(text[i : i + TELEGRAM_MAX_LEN])
+
 
 
 async def _safe_edit(status_msg, text: str) -> None:
@@ -362,6 +548,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if voice is None:
         return
 
+    if not _is_authorized(update.effective_user.id):
+        await update.message.reply_text(
+            "برای استفاده از این ربات نیاز به اشتراک فعال داری. "
+            "برای خرید یا تمدید اشتراک با ادمین در ارتباط باش."
+        )
+        return
+
     status_msg = await update.message.reply_text("در حال دریافت ویس... ⏳")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -411,6 +604,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     msg = update.message
     media = msg.video or msg.video_note or msg.document
     if media is None:
+        return
+
+    if not _is_authorized(update.effective_user.id):
+        await msg.reply_text(
+            "برای استفاده از این ربات نیاز به اشتراک فعال داری. "
+            "برای خرید یا تمدید اشتراک با ادمین در ارتباط باش."
+        )
         return
 
     status_msg = await msg.reply_text("در حال دریافت ویدیو... ⏳")
@@ -465,8 +665,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def main() -> None:
+    try:
+        subscriptions.init_db()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("DB init failed (subscriptions will fail closed): %s", exc)
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("adduser", adduser_cmd))
+    app.add_handler(CommandHandler("removeuser", removeuser_cmd))
+    app.add_handler(CommandHandler("listusers", listusers_cmd))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(
         MessageHandler(
